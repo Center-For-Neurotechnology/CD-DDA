@@ -1,43 +1,36 @@
-# Python package installation script
-# This file contains the Python equivalents of Julia packages needed for replicating the results
-
-# Run this script to install all required packages:
-# python julia_first_setup.py
+# Python equivalent of Julia package installation
+# Install packages using pip if needed
 
 import subprocess
 import sys
 
+def install_package(package):
+    """Install a package using pip"""
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Equivalent packages to Julia ones
 packages = [
-    "numpy",  # Linear algebra and array operations
-    "pandas",  # DataFrames equivalent
-    "matplotlib",  # Plotting
-    "scipy",  # Statistics and scientific computing
-    "networkx",  # Graphs equivalent
-    "h5py",  # HDF5 file support (similar to JLD2)
-    "mat73",  # MATLAB file support
-    "seaborn",  # Additional plotting capabilities
+    "numpy",           # For arrays and mathematical operations
+    "pandas",          # For DataFrames
+    "scipy",           # For scientific computing and linear algebra
+    "matplotlib",      # For plotting
+    "statsmodels",     # For statistical operations
+    "h5py",           # For HDF5 file I/O (similar to JLD2)
+    "networkx",       # For graph operations
+    "seaborn",        # For enhanced plotting
 ]
 
+print("Python packages for CD-DDA analysis:")
+for package in packages:
+    print(f"- {package}")
 
-def install_packages():
-    """Install required Python packages"""
-    for package in packages:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            print(f"Successfully installed {package}")
-        except subprocess.CalledProcessError:
-            print(f"Failed to install {package}")
+# Uncomment the following lines to actually install packages
+# for package in packages:
+#     try:
+#         install_package(package)
+#         print(f"Successfully installed {package}")
+#     except subprocess.CalledProcessError:
+#         print(f"Failed to install {package}")
 
-
-if __name__ == "__main__":
-    print("Installing required Python packages for DDA project...")
-    install_packages()
-    print("\nInstallation complete!")
-    print("\nNote: Some Julia-specific packages have Python equivalents:")
-    print("- Combinatorics -> itertools (built-in)")
-    print("- Printf -> f-strings or format() (built-in)")
-    print("- Random -> numpy.random")
-    print("- DelimitedFiles -> numpy.loadtxt/savetxt")
-    print("- LaTeXStrings -> matplotlib supports LaTeX in labels")
-    print("- GraphRecipes -> networkx + matplotlib")
-    print("- Colors -> matplotlib.colors")
+print("\nTo install packages manually, run:")
+print("pip install " + " ".join(packages))

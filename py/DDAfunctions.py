@@ -1,352 +1,342 @@
-"""
-Delay Differential Analysis (DDA) utility functions.
-
-This module provides core functionality for DDA analysis including:
-- ODE integration
-- Monomial generation
-- Model creation
-- Noise addition
-"""
-
-import platform
-import subprocess
-from pathlib import Path
-from typing import List, Optional, Tuple
-
 import numpy as np
-from numpy.typing import NDArray
+import os
+import subprocess
+import platform
+from itertools import combinations
+
+nr_delays = 2
+
+if platform.system() == "Windows":
+    SL = "\\"
+else:
+    SL = "/"
 
 
-# Platform-specific path separator
-SL = "\\" if platform.system() == "Windows" else "/"
+def index(DIM, ORDER):
+    B = np.ones((DIM**ORDER, ORDER), dtype=int)
+
+    if DIM > 1:
+        # Julia: for i = 2:(DIM^ORDER)  ->  Python: for i in range(1, DIM**ORDER)
+        for i in range(1, DIM**ORDER):  # i corresponds to Julia's i (1-based)
+            # Julia: if B[i-1, ORDER] < DIM  ->  Python: if B[i-1, ORDER-1] < DIM
+            if B[i - 1, ORDER - 1] < DIM:
+                B[i, ORDER - 1] = B[i - 1, ORDER - 1] + 1
+
+            # Julia: for i_DIM = 1:ORDER-1  ->  Python: for i_DIM in range(1, ORDER)
+            for i_DIM in range(1, ORDER):
+                if round(((i + 1) / DIM**i_DIM - np.floor((i + 1) / DIM**i_DIM)) * DIM**i_DIM) == 1:
+                    # Julia: if B[i-DIM^i_DIM, ORDER-i_DIM] < DIM
+                    if B[i - DIM**i_DIM, ORDER - i_DIM - 1] < DIM:
+                        # Julia: for j = 0:DIM^i_DIM-1
+                        for j in range(DIM**i_DIM):
+                            # Julia: B[i+j, ORDER-i_DIM] = B[i+j-DIM^i_DIM, ORDER-i_DIM] + 1
+                            B[i + j, ORDER - i_DIM - 1] = B[i + j - DIM**i_DIM, ORDER - i_DIM - 1] + 1
+
+        i_BB = 0
+        BB = []
+        for i in range(B.shape[0]):
+            jn = 1
+            # Julia: for j = 2:ORDER  ->  Python: for j in range(1, ORDER)
+            for j in range(1, ORDER):
+                # Julia: if B[i, j] >= B[i, j-1]  ->  Python: if B[i, j] >= B[i, j-1]
+                if B[i, j] >= B[i, j - 1]:
+                    jn += 1
+            if jn == ORDER:
+                BB.append(B[i, :])
+                i_BB += 1
+    else:
+        print("DIM=1!!!")
+
+    return np.array(BB).T
 
 
-def ensure_directory_exists(directory: str) -> None:
-    """Create directory if it doesn't exist.
-
-    Args:
-        directory: Path to directory to create
-    """
-    Path(directory).mkdir(exist_ok=True)
+def monomial_list(nr_delays, order):
+    P_ODE = index(nr_delays + 1, order).T
+    P_ODE = P_ODE - np.ones(P_ODE.shape, dtype=int)
+    P_ODE = P_ODE[1:, :]
+    return P_ODE
 
 
-# Maintain backward compatibility
-dir_exist = ensure_directory_exists
+def make_MOD_nr(SYST, NrSyst):
+    DIM = len(np.unique(SYST[:, 0]))
+    order = SYST.shape[1] - 1
+
+    P = np.vstack([np.array([[0, 0]]), monomial_list(DIM * NrSyst, order)])
+
+    MOD_nr = np.zeros((SYST.shape[0] * NrSyst, 2), dtype=int)
+    for n in range(NrSyst):
+        for i in range(SYST.shape[0]):
+            II = SYST[i, 1:].copy()
+            II[II > 0] += DIM * n
+
+            Nr = i + SYST.shape[0] * n
+            # Match Julia's logic: findall(sum(abs.(repeat(II, size(P, 1), 1) - P), dims=2)' .== 0)[1][2] - 1
+            diff = np.abs(P - II).sum(axis=1)
+            match_indices = np.where(diff == 0)[0]
+            if len(match_indices) > 0:
+                MOD_nr[Nr, 1] = match_indices[0]  # Julia uses 1-based, but we need 0-based index for P
+            else:
+                raise ValueError(f"No matching polynomial found for system {n}, equation {i}")
+            MOD_nr[Nr, 0] = SYST[i, 0] + DIM * n
+
+    # Julia: MOD_nr = reshape(MOD_nr', size(SYST, 1) * NrSyst * 2)'
+    # Julia uses column-major order (Fortran-style) for reshape
+    MOD_nr = MOD_nr.T.reshape(-1, order='F')  # Column-major flatten after transpose
+    return MOD_nr, DIM, order, P
 
 
-def integrate_ode_general(
-    model_numbers: NDArray,
-    model_parameters: NDArray,
-    dt: float,
-    length: int,
-    dimension: int,
-    ode_order: int,
-    initial_conditions: NDArray,
-    output_filename: str,
-    channel_list: List[int],
-    delta: int,
-    transient: Optional[int] = None,
-) -> Optional[NDArray]:
-    """
-    Integrate ODE system using external executable.
+def integrate_ODE_general_BIG(
+    MOD_nr, MOD_par, dt, L, DIM, ODEorder, X0, FNout, CH_list, DELTA, TRANS=None
+):
+    if TRANS is None:
+        TRANS = 0
 
-    Args:
-        model_numbers: Model number array
-        model_parameters: Model parameters array
-        dt: Time step
-        length: Number of time steps
-        dimension: System dimension
-        ode_order: ODE order
-        initial_conditions: Initial conditions
-        output_filename: Output file name (empty string to return data)
-        channel_list: List of channels to output
-        delta: Output every delta-th point
-        transient: Transient time steps to skip
-
-    Returns:
-        Array of integrated values if output_filename is empty, None otherwise
-    """
-    if transient is None:
-        transient = 0
-
-    # Determine executable name based on platform
     if platform.system() == "Windows":
-        executable = ".\\i_ODE_general_BIG.exe"
-        # Copy executable if needed
-        if not Path("i_ODE_general_BIG.exe").exists():
+        if not os.path.isfile("i_ODE_general_BIG.exe"):
             import shutil
 
             shutil.copy("i_ODE_general_BIG", "i_ODE_general_BIG.exe")
+        CMD = ".\\i_ODE_general_BIG.exe"
     else:
-        executable = "./i_ODE_general_BIG"
+        CMD = "./i_ODE_general_BIG"
 
-    # Build command line arguments
-    cmd_parts = [
-        executable,
-        "-MODEL",
-        " ".join(map(str, model_numbers)),
-        "-PAR",
-        " ".join(map(str, model_parameters)),
-        "-ANF",
-        " ".join(map(str, initial_conditions)),
-        "-dt",
-        str(dt),
-        "-L",
-        str(length),
-        "-DIM",
-        str(dimension),
-        "-order",
-        str(ode_order),
-        "-DELTA",
-        str(delta),
-        "-CH_list",
-        " ".join(map(str, channel_list)),
-    ]
+    MOD_NR = " ".join(map(str, MOD_nr))
+    CMD = f"{CMD} -MODEL {MOD_NR}"
+    MOD_PAR = " ".join(map(str, MOD_par))
+    CMD = f"{CMD} -PAR {MOD_PAR}"
+    ANF = " ".join(map(str, X0.flatten()))
+    CMD = f"{CMD} -ANF {ANF}"
+    CMD = f"{CMD} -dt {dt}"
+    CMD = f"{CMD} -L {L}"
+    CMD = f"{CMD} -DIM {DIM}"
+    CMD = f"{CMD} -order {ODEorder}"
+    if TRANS > 0:
+        CMD = f"{CMD} -TRANS {TRANS}"
+    if len(FNout) > 0:
+        CMD = f"{CMD} -FILE {FNout}"
+    CMD = f"{CMD} -DELTA {DELTA}"
+    CMD = f"{CMD} -CH_list {' '.join(map(str, CH_list))}"
 
-    if transient > 0:
-        cmd_parts.extend(["-TRANS", str(transient)])
-
-    if output_filename:
-        cmd_parts.extend(["-FILE", output_filename])
-
-    # Execute command
-    if platform.system() == "Windows":
-        # Windows needs split arguments
-        result = subprocess.run(
-            cmd_parts, capture_output=not output_filename, text=True
-        )
+    if len(FNout) > 0:
+        subprocess.run(CMD, shell=True)
     else:
-        # Unix-like systems use shell
-        cmd = " ".join(cmd_parts)
-        result = subprocess.run(
-            cmd, shell=True, capture_output=not output_filename, text=True
-        )
-
-    # Process output if no file specified
-    if not output_filename:
-        lines = result.stdout.strip().split("\n")
-        return np.array([list(map(float, line.split())) for line in lines])
-
-    return None
+        result = subprocess.run(CMD, shell=True, capture_output=True, text=True)
+        X = result.stdout.strip().split("\n")
+        X = np.array([list(map(float, row.split())) for row in X])
+        return X
 
 
-# Maintain backward compatibility
-integrate_ODE_general_BIG = integrate_ode_general
+def make_MOD_nr_Coupling(FromTo, DIM, P):
+    order = P.shape[1]
+    II = np.zeros((FromTo.shape[0], 4), dtype=int)
+
+    for j in range(II.shape[0]):
+        n1 = FromTo[j, 0]
+        k1 = FromTo[j, 1] + 1
+        range1 = slice(2, 2 + order)
+        n2 = FromTo[j, 1 + order + 1]
+        k2 = FromTo[j, 2 + order + 1] + 1
+        # Julia: range2 = range1 .+ range1[end] where range1=[3,4] (1-based), range1[end]=4
+        # So range2 = [3,4] + 4 = [7,8] (1-based) = [6,7] (0-based)
+        range2 = slice(6, 6 + order)
+
+        JJ = FromTo[j, range1].copy()
+        JJ[JJ > 0] += DIM * (n1 - 1)
+        diff = np.abs(P - JJ).sum(axis=1)
+        match_indices = np.where(diff == 0)[0]
+        if len(match_indices) > 0:
+            II[j, 3] = match_indices[0]
+        else:
+            raise ValueError(f"No matching polynomial found for coupling {j}, first part")
+
+        JJ = FromTo[j, range2].copy()
+        JJ[JJ > 0] += DIM * (n2 - 1)
+        diff = np.abs(P - JJ).sum(axis=1)
+        match_indices = np.where(diff == 0)[0]
+        if len(match_indices) > 0:
+            II[j, 1] = match_indices[0]
+        else:
+            raise ValueError(f"No matching polynomial found for coupling {j}, second part")
+
+        II[j, 0] = DIM * n2 - (DIM - k2) - 1
+        II[j, 2] = DIM * n2 - (DIM - k1) - 1
+
+    II = II.T.flatten()
+    return II
 
 
-def generate_monomial_indices(dimension: int, order: int) -> NDArray:
-    """
-    Generate index array for monomials.
-
-    Args:
-        dimension: Number of variables
-        order: Maximum order of monomials
-
-    Returns:
-        Array of monomial indices
-    """
-    if dimension == 1:
-        return np.array([[1]]).T
-
-    total_monomials = dimension**order
-    indices = np.ones((total_monomials, order), dtype=int)
-
-    for i in range(1, total_monomials):
-        # Update last column
-        if indices[i - 1, order - 1] < dimension:
-            indices[i, order - 1] = indices[i - 1, order - 1] + 1
-
-        # Update other columns
-        for col in range(order - 1):
-            power = dimension ** (col + 1)
-            position = i / power
-            fractional_part = position - np.floor(position)
-
-            if round(fractional_part * power) == 1:
-                prev_row = i - power - 1
-                if indices[prev_row, order - col - 2] < dimension:
-                    for j in range(power):
-                        if i + j < total_monomials:
-                            indices[i + j, order - col - 2] = (
-                                indices[prev_row, order - col - 2] + 1
-                            )
-
-    # Filter valid monomials
-    valid_monomials = []
-    for row in indices:
-        if all(row[j] >= row[j - 1] for j in range(1, order)):
-            valid_monomials.append(row.tolist())
-
-    return np.array(valid_monomials).T
+def dir_exist(DIR):
+    if not os.path.isdir(DIR):
+        os.mkdir(DIR)
 
 
-# Maintain backward compatibility
-index = generate_monomial_indices
+def add_noise(s, SNR):
+    N = len(s)
+    n = np.random.randn(N)
+    n = (n - np.mean(n)) / np.std(n)
+    c = np.sqrt(np.var(s) * 10 ** (-SNR / 10))
+    s_out = s + c * n
+    return s_out
 
 
-def generate_monomial_list(num_delays: int, order: int) -> NDArray:
-    """
-    Generate list of monomials for delay coordinates.
-
-    Args:
-        num_delays: Number of delay variables
-        order: Maximum order of monomials
-
-    Returns:
-        Array of monomials
-    """
-    monomials = generate_monomial_indices(num_delays + 1, order).T
-    monomials = monomials - 1
-    return monomials[1:, :]
+def number_to_string(n):
+    return f"{n:.15f}"
 
 
-# Maintain backward compatibility
-monomial_list = generate_monomial_list
+def make_MODEL_new(MOD, SSYM, mm):
+    MODEL = np.where(MOD[mm, :] == 1)[0]
+    L_AF = len(MODEL) + 1
+    SYM = SSYM[mm, :]
+    model = "_".join([f"{x:02d}" for x in MODEL])
+    return MODEL, SYM, model, L_AF
 
 
-def create_model(system: NDArray) -> Tuple[NDArray, int, int]:
-    """
-    Create MODEL from system specification.
+def make_MODEL(SYST):
+    order = SYST.shape[1]
+    nr_delays = 2
 
-    Args:
-        system: System specification array
+    P_ODE = monomial_list(nr_delays, order)
 
-    Returns:
-        Tuple of (model indices, L_AF, order)
-    """
-    order = system.shape[1]
-    model = np.arange(system.shape[0], dtype=int)
-    l_af = len(model) + 1
+    MODEL = np.zeros(SYST.shape[0], dtype=int)
+    for i in range(SYST.shape[0]):
+        II = SYST[i, :]
+        diff = np.abs(P_ODE - II).sum(axis=1)
+        MODEL[i] = np.where(diff == 0)[0][0]
 
-    return model, l_af, order
-
-
-# Maintain backward compatibility
-make_MODEL = create_model
+    L_AF = len(MODEL) + 1
+    return MODEL, L_AF, order
 
 
-def create_mod_nr(
-    system: NDArray, num_systems: int
-) -> Tuple[NDArray, int, int, NDArray]:
-    """
-    Create MOD_nr encoding for multiple coupled systems.
+def deriv_all(data, dm, order=None, dt=None):
+    if order is None:
+        order = 2
+    if dt is None:
+        dt = 1
 
-    Args:
-        system: Single system specification
-        num_systems: Number of coupled systems
+    t = np.arange(dm, len(data) - dm)
+    L = len(t)
 
-    Returns:
-        Tuple of (mod_nr, dimension, order, monomial array P)
-    """
-    dimension = len(np.unique(system[:, 0]))
-    order = system.shape[1] - 1
+    if order == 2:
+        ddata = np.zeros(L)
+        for n1 in range(1, dm + 1):
+            ddata += (data[t + n1] - data[t - n1]) / n1
+        ddata /= dm / dt
 
-    # Collect all needed monomials
-    needed_monomials = set()
-    for n in range(num_systems):
-        for i in range(system.shape[0]):
-            monomial = system[i, 1:].copy()
-            monomial[monomial > 0] += dimension * n
-            needed_monomials.add(tuple(monomial))
+    if order == 3:
+        ddata = np.zeros(L)
+        d = 0
+        for n1 in range(1, dm + 1):
+            for n2 in range(n1 + 1, dm + 1):
+                d += 1
+                ddata -= (
+                    (data[t - n2] - data[t + n2]) * n1**3
+                    - (data[t - n1] - data[t + n1]) * n2**3
+                ) / (n1**3 * n2 - n1 * n2**3)
+        ddata /= d / dt
 
-    # Create monomial array
-    monomial_array = np.array(sorted(needed_monomials))
-
-    # Build MOD_nr
-    mod_nr = np.zeros((system.shape[0] * num_systems, 2), dtype=int)
-
-    for n in range(num_systems):
-        for i in range(system.shape[0]):
-            monomial = system[i, 1:].copy()
-            monomial[monomial > 0] += dimension * n
-
-            # Find matching monomial
-            row_index = i + system.shape[0] * n
-            differences = np.abs(monomial_array - monomial)
-            matches = np.where(differences.sum(axis=1) == 0)[0]
-
-            if len(matches) == 0:
-                raise ValueError(f"No match found for monomial {monomial}")
-
-            mod_nr[row_index, 1] = matches[0]
-            mod_nr[row_index, 0] = system[i, 0] + dimension * n
-
-    return mod_nr.flatten(), dimension, order, monomial_array
+    return ddata
 
 
-# Maintain backward compatibility
-make_MOD_nr = create_mod_nr
+def make_MOD_new_new(N_MOD, nr_delays, order):
+    if nr_delays != 2:
+        print("only nr_delays=2 supported")
+        nr_delays = 2
+
+    P_DDA = monomial_list(nr_delays, order)
+    L = P_DDA.shape[0]
+
+    PP = -P_DDA.copy()
+    PP[PP == -1] = 2
+    PP[PP == -2] = 1
+    PP = np.sort(PP, axis=1)
+
+    f = np.zeros((P_DDA.shape[0], 2), dtype=int)
+    for k1 in range(P_DDA.shape[0]):
+        f[k1, 0] = k1
+        diff = np.abs(P_DDA - PP[k1, :]).sum(axis=1)
+        ff = np.where(diff == 0)[0]
+        if len(ff) > 0:
+            f[k1, 1] = ff[0]
+
+    MOD = np.zeros((1, P_DDA.shape[0]), dtype=int)
+    for n_N in range(len(N_MOD)):
+        N = N_MOD[n_N]
+        C = list(combinations(range(L), N))
+        C = np.array(C)
+        M = np.zeros((len(C), L), dtype=int)
+
+        for c in range(len(C)):
+            M[c, C[c]] = 1
+
+        M1 = np.sort(M * np.arange(1, L + 1), axis=1)[:, -N:]
+        M2 = -M1.copy()
+
+        for k1 in range(f.shape[0]):
+            M2[M2 == -f[k1, 0]] = f[k1, 1]
+        M2 = np.sort(M2, axis=1)
+
+        f2 = np.zeros((M1.shape[0], 2), dtype=int)
+        for k1 in range(M1.shape[0]):
+            f2[k1, 0] = k1
+            diff = np.abs(M1 - M2[k1, :]).sum(axis=1)
+            ff = np.where(diff == 0)[0]
+            if len(ff) > 0:
+                f2[k1, 1] = ff[0]
+
+        f2 = np.sort(f2, axis=1)
+        f2 = np.unique(f2, axis=0)
+        f2 = f2[f2[:, 0] != f2[:, 1], 1]
+        f2 = np.setdiff1d(np.arange(M1.shape[0]), f2)
+
+        MOD = np.vstack([MOD, M[f2, :]])
+
+    MOD = MOD[1:, :]
+
+    SSYM = np.full((MOD.shape[0], 2), -1, dtype=int)
+    for n_M in range(MOD.shape[0]):
+        p = P_DDA[MOD[n_M, :] == 1, :]
+
+        SSYM[n_M, 0] = len(np.unique(p[p > 0]))
+
+        p = p.astype(float)
+        p[p == 0] = np.nan
+        p1 = (p + 2) % 2 + 1
+        p1[np.isnan(p1)] = 0
+        p1 = p1.astype(int)
+        p[np.isnan(p)] = 0
+        p = p.astype(int)
+
+        p1 = np.sort(p1, axis=1)
+        p1 = p1[np.lexsort(p1.T)]
+
+        if np.sum(np.abs(p - p1)) == 0:
+            SSYM[n_M, 1] = 1
+        else:
+            SSYM[n_M, 1] = 0
+
+    return MOD, P_DDA, SSYM
 
 
-def create_coupling_mod_nr(
-    from_to: NDArray, dimension: int, monomial_array: NDArray
-) -> NDArray:
-    """
-    Create MOD_nr for coupling between systems.
+def make_TAU_ALL(SSYM, DELAYS):
+    uSYM = np.unique(SSYM, axis=0)
+    for k in range(uSYM.shape[0]):
+        s = uSYM[k, :]
+        nr = s[0]
+        sym = s[1]
 
-    Args:
-        from_to: Coupling specification array
-        dimension: System dimension
-        monomial_array: Array of monomials
-
-    Returns:
-        Flattened coupling MOD_nr array
-    """
-    order = monomial_array.shape[1]
-    coupling_indices = np.zeros((from_to.shape[0], 4), dtype=int)
-
-    for j in range(coupling_indices.shape[0]):
-        # Extract system and equation indices
-        n1 = int(from_to[j, 0])
-        k1 = int(from_to[j, 1]) + 1
-        range1 = list(range(2, 2 + order))
-
-        n2 = int(from_to[j, 1 + range1[-1]])
-        k2 = int(from_to[j, 2 + range1[-1]]) + 1
-        range2 = [r + range1[-1] for r in range1]
-
-        # Process first monomial
-        monomial1 = from_to[j, range1].copy()
-        monomial1[monomial1 > 0] += dimension * (n1 - 1)
-        differences = np.abs(monomial_array - monomial1)
-        matches = np.where(differences.sum(axis=1) == 0)[0]
-        coupling_indices[j, 3] = matches[0] - 1
-
-        # Process second monomial
-        monomial2 = from_to[j, range2].copy()
-        monomial2[monomial2 > 0] += dimension * (n2 - 1)
-        differences = np.abs(monomial_array - monomial2)
-        matches = np.where(differences.sum(axis=1) == 0)[0]
-        coupling_indices[j, 1] = matches[0] - 1
-
-        # Set system indices
-        coupling_indices[j, 0] = dimension * n2 - (dimension - k2) - 1
-        coupling_indices[j, 2] = dimension * n2 - (dimension - k1) - 1
-
-    return coupling_indices.flatten()
-
-
-# Maintain backward compatibility
-make_MOD_nr_Coupling = create_coupling_mod_nr
-
-
-def add_noise(signal: NDArray, snr_db: float) -> NDArray:
-    """
-    Add Gaussian noise to signal with specified SNR.
-
-    Args:
-        signal: Input signal
-        snr_db: Signal-to-noise ratio in dB
-
-    Returns:
-        Noisy signal
-    """
-    # Generate zero-mean, unit-variance noise
-    noise = np.random.randn(len(signal))
-    noise = (noise - noise.mean()) / noise.std()
-
-    # Calculate noise scaling from SNR
-    signal_variance = np.var(signal)
-    noise_scale = np.sqrt(signal_variance * 10 ** (-snr_db / 10))
-
-    return signal + noise_scale * noise
+        FN = f"TAU_ALL__{s[0]}_{s[1]}"
+        with open(FN, "w") as fid:
+            if nr == 1:
+                for tau1 in range(len(DELAYS)):
+                    fid.write(f"{DELAYS[tau1]}\n")
+            elif nr == 2:
+                if sym == 0:
+                    for tau1 in range(len(DELAYS)):
+                        for tau2 in range(len(DELAYS)):
+                            if tau1 != tau2:
+                                fid.write(f"{DELAYS[tau1]} {DELAYS[tau2]}\n")
+                elif sym == 1:
+                    for tau1 in range(len(DELAYS)):
+                        for tau2 in range(len(DELAYS)):
+                            if tau1 < tau2:
+                                fid.write(f"{DELAYS[tau1]} {DELAYS[tau2]}\n")
