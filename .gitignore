@@ -1,0 +1,5 @@
+*.ascii
+*.mat
+*.DDA_*
+*.jld2
+*.png

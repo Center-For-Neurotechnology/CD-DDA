@@ -4,9 +4,9 @@ include("DDAfunctions.jl");                                            # set of 
 WL=2000;WS=500;                                                        # window length and shift
 global WN=500;
 
-DDA_DIR  = "DDA";  dir_exist(DDA_DIR);                                 # folders
-DATA_DIR = "DATA";
-FIG_DIR  = "FIG";  dir_exist(FIG_DIR); 
+DDA_DIR  = "DDA_rossler";  dir_exist(DDA_DIR);                                 # folders
+DATA_DIR = "DATA_rossler";
+FIG_DIR  = "FIG_rossler";  dir_exist(FIG_DIR); 
 
 NOISE=["NoNoise";"15dB"];
 
