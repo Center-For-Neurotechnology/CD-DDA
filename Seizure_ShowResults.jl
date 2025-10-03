@@ -8,8 +8,8 @@ include("DDAfunctions.jl")  # must provide dir_exist, make_MODEL, etc.
 
 # ------------------------ USER SETTINGS ------------------------
 const BASE_ID = "MG177Sz1__WL2048_WS1024_WN2048"
-const DDA_DIR = "DDA"
-const FIG_DIR = "FIG"
+const DDA_DIR = "DDA_MG177Sz1"
+const FIG_DIR = "FIG_MG177Sz1"
 dir_exist(FIG_DIR)
 
 # ------------------------ MODEL (seizure) ------------------------
